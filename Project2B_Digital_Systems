@@ -1,0 +1,239 @@
+.section .reset, "ax"
+.global _start 
+.equ O_UART_DATA,     0x1000 #offset for the UART's data register
+.equ O_UART_CTRL,     0x1004 #offset for UART's control register
+.equ O_7SEG_LO,       0x20 #offsets for the 7 segment display 
+.equ O_7SEG_HI,       0x30
+
+
+##### Macros ########
+.macro rori dst, src, i
+    roli    \dst, \src, (32 - \i)  #right rotate macro
+.endm
+
+
+_start:
+    movia sp, 0x1000
+    movia gp, 0xff200000
+    br main
+
+.section .exceptions, "ax"
+    rdctl et, ipending
+    bne et, r0, HardwareInterrupt
+    eret
+
+HardwareInterrupt: 
+    subi ea, ea, 4 #rewind ea to restart abort 
+    subi sp, sp, 8 #save all registers used by the IRQ handlers
+    stw r2, 0(sp)
+    stw r3, 4(sp)
+    andi r2, et, 0b10   #check if irq number 1
+    beq r2, r0, NotIRQ1
+    
+########handle pushbutton isr for irq#1
+
+    ldwio r3, 0x5c(gp)   #Read EdgeCapture register
+    stwio r3, 0x5c(gp)   #Reset EdgeCapture bits: Deassert IRQ1
+
+    #make {1, 2} into {-1, +1}
+    #slli r3, r3, 1 #{2, 4}
+    #subi r3, r3, 3 #{-1, +1}
+    #if r3 == 2, 
+    ldwio r2, (gp)
+    add r2, r2, r3   #increment LED's 
+    stwio r2, (gp)
+    
+    
+
+NotIRQ1:
+    andi r2, et, 0b001 #check if irq0
+    beq r2, r0, NotIRQ0 
+    
+####Handle Timer2 ISR for IRQ#0
+    #this interrupt should be called every 10 milliseconds. The variable Counter is used to store the value of the 
+    #timer and we will thus add 1 (hundredth of a second) to this value every time the irq executes
+    stwio r0, 0x2000(gp)  #"TO" <- 0
+    ldw r2, Counter(r0)   #load the counter
+    addi r2, r2, 1        #Add one to counter right now 
+    stw r2, Counter(r0)   #save the counter's new value
+
+NotIRQ0:
+
+ISR_END:
+    ldw r2, 0(sp)
+    ldw r3, 4(sp) #restore r3 and r2 
+    addi sp, sp, 8 #restore stack 
+    eret
+    
+.text 
+main: 
+    movi r2, 3         #both button 0 and 1 generate interrupts 0b11 = 3
+    stwio r2, 0x58(gp) #Send 0b11 to interrupt mask register
+    movia r2, 1000000  #1e8 = 100M => 1Hz 
+    stwio r2, 0x2008(gp) #Timer1 Lo 16-bits
+    srli r2, r2, 16 #shift right by 16 bits
+    stwio r2, 0x200c(gp) #Timer1 Hi 16-bits
+    movi r2, 0b0111      #Timer1 Ctl <- START
+    stwio r2, 0x2004(gp)
+    movi r2, 0b11     #enable IRQ0 and IRQ1
+    wrctl ienable, r2 
+    movi r2, 1
+    wrctl status, r2
+
+loop:
+    movi r2, 1
+    wrctl status, r2 #enable interrupts in case we are coming from loop_no_clock
+    
+    ldwio r2, 0x40(gp)
+    movi r11, 1
+    movi r12, 2
+    movi r13, 4
+    andi r8, r2, 0b1
+    andi r9, r2, 0b10
+    andi r10, r2, 0b100
+    
+    beq r10, r13, reset
+    beq r9, r12, loop_no_display 
+    beq r8, r11, loop_no_clock 
+    
+    addi r5, r5, 1
+    addi r6, r6, 1
+    ldw r4, Counter(r0)
+    call showNum
+    br loop
+
+loop_no_display:
+    movi r2, 1
+    wrctl status, r2 #enable interrupts in case we are coming from loop_no_clock
+    
+    ldwio r2, 0x40(gp)
+    movi r11, 1
+    movi r12, 2
+    movi r13, 4
+    andi r8, r2, 0b1
+    andi r9, r2, 0b10
+    andi r10, r2, 0b100
+    
+    beq r10, r13, reset
+    beq r9, r0, loop
+    beq r8, r11, loop_no_clock 
+    br loop_no_display
+
+loop_no_clock:
+    movi r2, 0
+    wrctl status, r2 #Disable interrupts 
+    
+    ldwio r2, 0x40(gp)
+    movi r11, 1
+    movi r12, 2
+    movi r13, 4
+    andi r8, r2, 0b1
+    andi r9, r2, 0b10
+    andi r10, r2, 0b100
+    
+    beq r10, r13, reset
+    beq r9, r12, loop_no_display
+    beq r8, r0, loop
+    br loop_no_clock
+
+reset:
+    stw r0, Counter(r0)
+    ldw r4, Lap(r0)
+    addi r4, r4, 1     
+    stw r4, Lap(r0)
+    call printNum
+    br loop
+    
+
+
+#void showNum(int n) -- convert to 7-seg bits
+showNum:
+    subi sp, sp, 4 
+    stw ra, (sp) 
+    
+    call num2bits
+    stwio r2, O_7SEG_LO(gp)
+    mov r4, r3
+    call num2bits
+    stwio r2, O_7SEG_HI(gp)
+    
+    ldw ra, (sp)
+    addi sp, sp, 4
+    ret
+
+#convert n to seven seg bits
+#bits returned in r2; final quotient returned in r3
+num2bits:
+    movi r2, 0 #Accumulate bits in r2, ready to return
+    movi r10, 10 #store 10 for dividing
+    movi r7, 4 #loop counter i
+    
+n2b_loop:   #do{
+    divu r3, r4, r10
+    mul r5, r3, r10
+    sub r5, r4, r5
+    ldbu r6, Bits7seg(r5)
+    or r2, r2, r6
+    rori r2, r2, 8 #using the rori macro
+    mov r4, r3
+    subi r7, r7, 1
+    bgt r7, r0, n2b_loop 
+    ret
+    
+    
+
+#void putchar(char c)
+putchar:
+    ldwio r2, O_UART_CTRL(gp)
+    srli r2, r2, 16
+    beq r2, r0, putchar
+    stwio r4, O_UART_DATA(gp)
+    ret
+
+printNum:
+    subi sp, sp, 8
+    stw ra, 4(sp)
+    bge r4, r0, not_neg
+    sub r4, r0, r4
+    stw r4, 0(sp)
+    movi r4, '-'
+    call putchar
+    ldw r4, 0(sp)
+    
+not_neg:
+    movi r10, 10 #if(n <10)
+    bge r4, r10, not_base
+    addi r4, r4, '0'  #putchar('0' + n);
+    call putchar
+    br printNum_done
+    
+not_base:
+    movi r10, 10
+    div r3, r4, r10  #r3 = n /10;
+    mul r5, r3, r10
+    sub r5, r4, r5  #r5 = n % 10;
+    stw r5, 0(sp)
+    mov r4, r3
+    call printNum    #printNum(n/10);
+    ldw r5, 0(sp)
+    addi r4, r5, '0'
+    call putchar   #putchar('0' + (n % 10));
+    
+printNum_done: 
+    ldw ra, 4(sp)
+    addi sp, sp, 8
+    ret 
+    
+
+.data 
+
+Bits7seg:
+    #        0.   1.     2.    3.   4.    5.    6.    7.    8.    9
+    .byte  0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x67
+    .byte  0x77, 0x7c, 0x39, 0x5E, 0x79, 0x71
+    #       A.    B      C.    D.   E.    F
+    
+Counter: .word 0 #Timer1 State variable 
+Lap: .word 0 #lap state variable 
+
+.end
